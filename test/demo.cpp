@@ -177,6 +177,19 @@ void publishData() {
     if (!client.connected()) return;
 
     // Montar JSON com todos os dados
+    // Formato do json:
+    /*
+        {
+            "ax": <float>, // Aceleração em X
+            "ay": <float>, // Aceleração em Y
+            "az": <float>, // Aceleração em Z
+            "magnitude": <float>, // Magnitude da aceleração
+            "peak_frequency": <float>, // Frequência de pico da FFT
+            "energy": <float>, // Energia da FFT
+            "probability": <float>, // Probabilidade da anomalia
+            "is_anomaly": <bool> // Indicador de anomalia
+        }
+    */
     char json_buffer[400];
     snprintf(json_buffer, sizeof(json_buffer),
              "{"
@@ -277,7 +290,7 @@ void setup() {
     mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
     mpu.setGyroRange(MPU6050_RANGE_500_DEG);
     mpu.setFilterBandwidth(MPU6050_BAND_184_HZ);
-    
+
     Serial.println("Coletando dados...\n");
     delay(100);
 }
