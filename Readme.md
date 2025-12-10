@@ -218,7 +218,7 @@ $$S = \sqrt{z_{freq}^2 + z_{energy}^2}$$
 **Regra de Decisão:**
 
 $$
-\text{is\_anomaly} = \begin{cases}
+\text{isAnomaly} = \begin{cases}
 \text{True} & \text{se } S > T \\
 \text{False} & \text{se } S \leq T
 \end{cases}
