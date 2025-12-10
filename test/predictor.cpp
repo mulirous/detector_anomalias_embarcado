@@ -1,10 +1,10 @@
 // ============================================================
-//   DETECTOR DE ANOMALIAS COM TINYML (TensorFlow Lite Micro)
+//       DEMO - DETECTOR DE ANOMALIAS COM ENVIO VIA MQTT
 // ============================================================
 // Este código demonstra como:
 // 1. Coletar dados do MPU6050
 // 2. Calcular magnitude, FFT, peak_frequency e energy
-// 3. Fazer inferência com Rede Neural via TensorFlow Lite Micro
+// 3. Fazer inferência do modelo de Regressão Logística
 // 4. Enviar JSON via MQTT com todos os dados
 // ============================================================
 
@@ -14,18 +14,6 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <math.h>
-
-// ============================================================
-// TENSORFLOW LITE MICRO
-// ============================================================
-#include <TensorFlowLite_ESP32.h>
-#include "tensorflow/lite/micro/all_ops_resolver.h"
-#include "tensorflow/lite/micro/micro_error_reporter.h"
-#include "tensorflow/lite/micro/micro_interpreter.h"
-#include "tensorflow/lite/schema/schema_generated.h"
-
-// Modelo TFLite gerado pelo notebook eda.ipynb
-#include "anomaly_model.h"
 
 Adafruit_MPU6050 mpu;
 
@@ -45,37 +33,27 @@ const char* mqtt_topic = "iot/murilo/mpu/anomalias";
 PubSubClient client(espClient);
 
 // ============================================================
-// PARÂMETROS DO STANDARDSCALER
-// (Extraídos do notebook eda.ipynb - mesmos usados no treinamento)
+// PARÂMETROS DO MODELO DE REGRESSÃO LOGÍSTICA
+// (Extraídos do notebook eda.ipynb)
 // ============================================================
+
+// Médias do StandardScaler (scaler.mean_)
 const float MEAN_PEAK_FREQ = 20.04262575f;
 const float MEAN_ENERGY = 8737.57146521f;
+
+// Desvios do StandardScaler (scaler.scale_)
 const float SCALE_PEAK_FREQ = 3.43938731f;
 const float SCALE_ENERGY = 8547.02116f;
 
+// Coeficientes da Regressão Logística (logreg.coef_[0])
+const float W_PEAK_FREQ = 0.35955423f;
+const float W_ENERGY = 0.96707036f;
+
+// Intercepto (logreg.intercept_[0])
+const float INTERCEPT = -0.75556951f;
+
 // Threshold de decisão
 const float THRESHOLD = 0.5f;
-
-// ============================================================
-// CONFIGURAÇÃO TENSORFLOW LITE MICRO
-// ============================================================
-
-// Arena de memória para o TensorFlow Lite (ajuste se necessário)
-constexpr int kTensorArenaSize = 8 * 1024;  // 8KB
-uint8_t tensor_arena[kTensorArenaSize];
-
-// Ponteiros globais do TFLite
-const tflite::Model* tflite_model = nullptr;
-tflite::MicroInterpreter* interpreter = nullptr;
-TfLiteTensor* input_tensor = nullptr;
-TfLiteTensor* output_tensor = nullptr;
-
-// Resolver de operações (inclui todas as ops)
-tflite::AllOpsResolver resolver;
-
-// Error Reporter para debug
-tflite::MicroErrorReporter micro_error_reporter;
-tflite::ErrorReporter* error_reporter = &micro_error_reporter;
 
 // ============================================================
 // CONFIGURAÇÃO FFT E BUFFERS
@@ -107,57 +85,14 @@ const unsigned long mqttReconnectInterval = 5000;
 // FUNÇÕES AUXILIARES
 // ============================================================
 
+// Função sigmoide
+float sigmoid(float z) {
+    return 1.0f / (1.0f + expf(-z));
+}
+
 // Calcular magnitude da aceleração
 float calcMagnitude(float ax, float ay, float az) {
     return sqrtf(ax * ax + ay * ay + az * az);
-}
-
-// ============================================================
-// INICIALIZAÇÃO DO TENSORFLOW LITE MICRO
-// ============================================================
-bool setupTFLite() {
-    Serial.println("Inicializando TensorFlow Lite Micro...");
-
-    // 1. Carregar o modelo
-    tflite_model = tflite::GetModel(anomaly_model);
-    if (tflite_model->version() != TFLITE_SCHEMA_VERSION) {
-        Serial.printf("Erro: Versão do modelo (%d) incompatível com schema (%d)!\n",
-                      tflite_model->version(), TFLITE_SCHEMA_VERSION);
-        return false;
-    }
-    Serial.println("  ✓ Modelo carregado");
-
-    // 2. Criar o interpretador
-    static tflite::MicroInterpreter static_interpreter(
-        tflite_model, resolver, tensor_arena, (size_t)kTensorArenaSize, error_reporter
-    );
-    interpreter = &static_interpreter;
-    Serial.println("  ✓ Interpretador criado");
-
-    // 3. Alocar memória para tensores
-    TfLiteStatus allocate_status = interpreter->AllocateTensors();
-    if (allocate_status != kTfLiteOk) {
-        Serial.println("Erro: Falha ao alocar tensores!");
-        return false;
-    }
-    Serial.printf("  ✓ Tensores alocados (arena usada: ~%d bytes)\n", kTensorArenaSize);
-
-    // 4. Obter ponteiros para entrada/saída
-    input_tensor = interpreter->input(0);
-    output_tensor = interpreter->output(0);
-
-    // 5. Verificar dimensões
-    Serial.printf("  Input:  shape=[%d, %d], type=%d\n",
-                  input_tensor->dims->data[0],
-                  input_tensor->dims->data[1],
-                  input_tensor->type);
-    Serial.printf("  Output: shape=[%d, %d], type=%d\n",
-                  output_tensor->dims->data[0],
-                  output_tensor->dims->data[1],
-                  output_tensor->type);
-
-    Serial.println("TensorFlow Lite Micro inicializado com sucesso!\n");
-    return true;
 }
 
 // ============================================================
@@ -207,29 +142,20 @@ void extractFFTFeatures(float* signal, int n, float* peak_frequency, float* ener
 }
 
 // ============================================================
-// INFERÊNCIA COM TENSORFLOW LITE MICRO
+// INFERÊNCIA DO MODELO DE REGRESSÃO LOGÍSTICA
 // ============================================================
-bool predictAnomalyTFLite(float peak_frequency, float energy, float* probability) {
-    // 1. Normalizar as features (StandardScaler - mesmo do treinamento)
+bool predictAnomaly(float peak_frequency, float energy, float* probability) {
+    // 1. Normalizar as features (StandardScaler)
     float z_freq = (peak_frequency - MEAN_PEAK_FREQ) / SCALE_PEAK_FREQ;
     float z_energy = (energy - MEAN_ENERGY) / SCALE_ENERGY;
 
-    // 2. Preencher o tensor de entrada
-    input_tensor->data.f[0] = z_freq;
-    input_tensor->data.f[1] = z_energy;
+    // 2. Calcular z = w0*x0 + w1*x1 + INTERCEPT
+    float z = W_PEAK_FREQ * z_freq + W_ENERGY * z_energy + INTERCEPT;
 
-    // 3. Executar inferência
-    TfLiteStatus invoke_status = interpreter->Invoke();
-    if (invoke_status != kTfLiteOk) {
-        Serial.println("Erro na inferência TFLite!");
-        *probability = -1.0f;
-        return false;
-    }
+    // 3. Aplicar sigmoide para obter probabilidade
+    *probability = sigmoid(z);
 
-    // 4. Obter a probabilidade de anomalia (saída da sigmoid)
-    *probability = output_tensor->data.f[0];
-
-    // 5. Decisão baseada no threshold
+    // 4. Decisão baseada no threshold
     return *probability > THRESHOLD;
 }
 
@@ -240,8 +166,8 @@ void processWindow() {
     // Extrair features FFT
     extractFFTFeatures(magnitude_buffer, WINDOW_SIZE, &last_peak_frequency, &last_energy);
 
-    // Fazer predição com TensorFlow Lite
-    last_is_anomaly = predictAnomalyTFLite(last_peak_frequency, last_energy, &last_probability);
+    // Fazer predição
+    last_is_anomaly = predictAnomaly(last_peak_frequency, last_energy, &last_probability);
 }
 
 // ============================================================
@@ -251,10 +177,22 @@ void publishData() {
     if (!client.connected()) return;
 
     // Montar JSON com todos os dados
+    // Formato do json:
+    /*
+        {
+            "ax": <float>, // Aceleração em X
+            "ay": <float>, // Aceleração em Y
+            "az": <float>, // Aceleração em Z
+            "magnitude": <float>, // Magnitude da aceleração
+            "peak_frequency": <float>, // Frequência de pico da FFT
+            "energy": <float>, // Energia da FFT
+            "probability": <float>, // Probabilidade da anomalia
+            "is_anomaly": <bool> // Indicador de anomalia
+        }
+    */
     char json_buffer[400];
     snprintf(json_buffer, sizeof(json_buffer),
              "{"
-             "\"model\":\"TinyML-MLP\","
              "\"ax\":%.4f,"
              "\"ay\":%.4f,"
              "\"az\":%.4f,"
@@ -277,10 +215,10 @@ void publishData() {
     client.publish(mqtt_topic, json_buffer);
 
     // Debug no Serial
-    Serial.println("--- Dados Publicados (TinyML) ---");
+    Serial.println("--- Dados Publicados ---");
     Serial.println(json_buffer);
     if (last_is_anomaly) {
-        Serial.println("⚠️  ANOMALIA DETECTADA!");
+        Serial.println("*** ANOMALIA DETECTADA! ***");
     }
     Serial.println();
 }
@@ -313,7 +251,7 @@ bool reconnectMQTT() {
     lastMqttReconnectAttempt = now;
     Serial.print("Tentando conexão MQTT... ");
 
-    String clientId = "ESP32TinyML-";
+    String clientId = "ESP32AnomalyDetector-";
     clientId += String(random(0xffff), HEX);
 
     if (client.connect(clientId.c_str())) {
@@ -333,19 +271,13 @@ void setup() {
     Serial.begin(115200);
     Wire.begin(SDA_PIN, SCL_PIN);
 
-    Serial.println("==========================================");
-    Serial.println("  DETECTOR DE ANOMALIAS - TinyML (TFLite)");
-    Serial.println("==========================================");
+    Serial.println("==============================================");
+    Serial.println("  DETECTOR DE ANOMALIAS - MODELO ESTATÍSTICO  ");
+    Serial.println("==============================================");
 
     // Conectar WiFi
     setup_wifi();
     client.setServer(mqtt_server, mqtt_port);
-
-    // Inicializar TensorFlow Lite Micro
-    if (!setupTFLite()) {
-        Serial.println("ERRO FATAL: Falha ao inicializar TFLite!");
-        while (1) delay(1000);
-    }
 
     // Inicializar MPU6050
     if (!mpu.begin()) {
@@ -401,7 +333,7 @@ void loop() {
             buffer_index = 0;
             buffer_ready = true;
 
-            // Processar janela e fazer predição com TinyML
+            // Processar janela e fazer predição
             processWindow();
 
             // Publicar dados via MQTT
